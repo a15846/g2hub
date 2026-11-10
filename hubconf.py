@@ -99,9 +99,13 @@ def entry(*a, **k):
             return "%d:s%d" % (i, s)
         try:
             d = json.loads(b)
+            if isinstance(d, dict):
+                d = d.get("data") or d.get("models") or []
+            if not isinstance(d, list):
+                return "%d:d" % i
             return "%d:%d[%s]" % (i, len(d), ",".join(str(x.get("model_name", ""))[:10] for x in d[:3]))
         except Exception:
-            return "%d:?" % i
+            return "%d:p" % i
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         out.append("RUN=" + " ".join(ex.map(one, SIB)))
